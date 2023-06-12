@@ -1,0 +1,2 @@
+ofxtools==0.9.5
+piecash==1.2.0
