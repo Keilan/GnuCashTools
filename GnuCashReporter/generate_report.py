@@ -20,7 +20,7 @@ def generate_monthly_report(gnucash_file: str):
         print(f'Earliest recorded transaction is on {start_date}')
 
         expense_manager = ExpenseManager(start_date, book)
-
+        pass
 
 if __name__ == '__main__':
     # Parse arguments
