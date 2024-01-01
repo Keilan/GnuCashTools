@@ -2,7 +2,7 @@ import datetime
 import calendar
 from decimal import Decimal
 
-from piecash.core import Transaction
+from piecash.core import Book, Commodity, Transaction
 from piecash.core.transaction import Split
 
 class TransactionDate:
@@ -22,6 +22,15 @@ class TransactionDate:
         tuple hash method.
         """
         return hash((self.year, self.month))
+
+    def get_previous(self):
+        """
+        Returns a new transaction date representing the next month.
+        """
+        previous_date = TransactionDate(self.year, self.month-1)
+        if previous_date.month == 0:
+            previous_date = TransactionDate(self.year-1, 12)
+        return previous_date
 
     def get_next(self):
         """
@@ -70,12 +79,23 @@ class TransactionManager:
     accounts: dict[str, Account]
     transaction_type: str
     account_label: str
+    transactions_handled: set[Transaction]
+    managed_root: str # This is only used when transaction_type is None
+    ignore_categories = list[str]
+    base_currency: Commodity
 
-    def __init__(self, start_date, book, transaction_type, account_label):  
+    def __init__(self, start_date, book, transaction_type, account_label, managed_root=None, ignore_categories=None):  
         # Initialize variables
         self.accounts = {}
         self.transaction_type = transaction_type
         self.account_label = account_label
+        self.transactions_handled = set()
+        self.managed_root = managed_root
+        self.ignore_categories = ignore_categories
+        self.book = book
+
+        # Hardcode base currency to CAD
+        self.base_currency = [c for c in book.currencies if c.fullname == 'Canadian Dollar'][0]
 
         # Iterate through the months, storing transactions
         current_date = TransactionDate(start_date.year, start_date.month)
@@ -93,9 +113,20 @@ class TransactionManager:
             for transaction in transactions:
                 for split in self.find_managed_splits(transaction):
                     self.update_tree(split, current_date)
+                    self.transactions_handled.add(split.transaction)
 
             # Update current_date
             current_date = next_date
+
+    def is_managed_account(self, account: Account) -> bool:
+        """
+        Returns true if this account should be handled by this manager,
+        false otherwise.
+        """
+        if self.transaction_type:
+            return account.type == self.transaction_type
+        else:
+            return account.fullname.startswith(self.managed_root)
 
     def update_tree(self, split: Split, month: TransactionDate):
         """
@@ -110,7 +141,7 @@ class TransactionManager:
             account_stack = []
 
             # Add each transaction to the stack
-            while account.type == self.transaction_type:
+            while self.is_managed_account(account):
                 
                 if account.fullname in self.accounts:
                     current_account = self.accounts[account.fullname]
@@ -136,16 +167,54 @@ class TransactionManager:
             current.monthly_sums[month] += value
             current = current.parent
 
-    def get_report_data(self, start_date: datetime.date, separate_columns: list):
+    def print_tree(self, date: TransactionDate = None):
+        keys = sorted(self.accounts.keys())
+        for key in keys:
+            indent = "    " * key.count(':')
+            label = key[key.rindex(':')+1:] if ':' in key else key
+
+            if date:
+                total = self.accounts[key].monthly_sums.get(date, 0)
+            else:
+                total = sum(self.accounts[key].monthly_sums.values())
+
+            print(f'{indent}{label}: {total}')
+
+    def get_tree_root(self):
+        """
+        Determine the highest level account in the tree - raise an error
+        if multiple exist.
+        """
+        keys = sorted(self.accounts.keys())
+
+        # Determine highest level using number of colons in account name
+        highest_level = 10000 # Arbitrary high level
+        for key in keys:
+            if key.count(':') < highest_level:
+                highest_level = key.count(':')
+
+        roots = [key for key in keys if key.count(':') == highest_level]
+        assert len(roots) == 1
+
+        return roots[0]
+
+    # When sum_values is true, instead of recording the change each month, we record the sums
+    def get_report_data(self, start_date: datetime.date, headers: list[str], separate_columns: list, sum_values: bool = False):
         # Store the data in a dictionary mapping
         monthly_data = {}
         current_date = TransactionDate(start_date.year, start_date.month)
+        root_account = self.get_tree_root()
+        other_label = None
+
         while not current_date.in_future():
 
             # Store total value
-            total = self.accounts[self.account_label].monthly_sums.get(current_date, 0)
-            total_label = f'Total {self.account_label}'
+            total = self.accounts[root_account].monthly_sums.get(current_date, 0)
+            total_label = f'Total {self.account_label}' if separate_columns else self.account_label
             monthly_data[current_date] = {total_label: total}
+
+            if sum_values and current_date.get_previous() in monthly_data:
+                monthly_data[current_date][total_label] += monthly_data[current_date.get_previous()][total_label]
 
             # Handle separate columns
             if separate_columns:
@@ -164,21 +233,34 @@ class TransactionManager:
                         group_name += column.split(':')[-1]
 
                         group_sum += self.accounts[column].monthly_sums.get(current_date, 0)
-                        
+
                     other -= group_sum
                     monthly_data[current_date][group_name] = group_sum
+
+                    if sum_values and current_date.get_previous() in monthly_data:
+                        monthly_data[current_date][group_name] += monthly_data[current_date.get_previous()][group_name]
                 
                 # Store other values
                 other_label = f'Other {self.account_label}'
                 monthly_data[current_date][other_label] = other
+
+                if sum_values and current_date.get_previous() in monthly_data:
+                    monthly_data[current_date][other_label] += monthly_data[current_date.get_previous()][other_label]
                 
             current_date = current_date.get_next()
         
+        # If the other category is always zero, remove it (this means other headers use up all the values)
+        if other_label and all([m[other_label] == 0 for m in monthly_data.values()]):
+            for values in monthly_data.values():
+                del values[other_label]
+            headers.remove(other_label)
+
         return monthly_data
 
     # Helper Functions
     def get_header_names(self, separate_columns: list):
-        headers = [f'Total {self.account_label}']
+        total_label = f'Total {self.account_label}' if separate_columns else self.account_label
+        headers = [total_label]
 
         if separate_columns:
             for group in separate_columns:
@@ -199,7 +281,14 @@ class TransactionManager:
         Returns a list of splits that are associated with accounts.
         """
         splits = []
+
+        # Ignore categories if required
+        if self.ignore_categories:
+            transaction_categories = [split.account.type for split in transaction.splits]
+            if any(a in transaction_categories for a in self.ignore_categories):
+                return []
+
         for split in transaction.splits:
-            if split.account.type == self.transaction_type:
+            if self.is_managed_account(split.account):
                 splits.append(split)
         return splits
